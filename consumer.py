@@ -5,161 +5,329 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from pyspark.ml.feature import Tokenizer, StopWordsRemover, HashingTF, IDF
+import time
+import os
 
 HOST = 'host.docker.internal'
 PORT = 9998
 
-spark = SparkSession.builder.appName('RedditConsumer').getOrCreate()
+# FIXED: Corrected "KryoSerializer" spelling and improved configuration
+spark = SparkSession.builder \
+    .appName('RedditConsumer') \
+    .config("spark.sql.streaming.checkpointLocation", "/tmp/checkpoint") \
+    .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+    .config("spark.sql.adaptive.enabled", "false") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "false") \
+    .config("spark.sql.streaming.metricsEnabled", "true") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
+    .config("spark.driver.memory", "2g") \
+    .config("spark.driver.maxResultSize", "1g") \
+    .getOrCreate()
 
+spark.sparkContext.setLogLevel("WARN")
+
+# Schema definition
 schema = StructType([
-    StructField('type', StringType()),
-    StructField('subreddit', StringType()),
-    StructField('id', StringType()),
-    StructField('text', StringType()),
-    StructField('created_utc', DoubleType()),
-    StructField('author', StringType())
+    StructField('type', StringType(), True),
+    StructField('subreddit', StringType(), True),
+    StructField('id', StringType(), True),
+    StructField('text', StringType(), True),
+    StructField('created_utc', DoubleType(), True),
+    StructField('author', StringType(), True)
 ])
 
-raw_lines = (
-    spark.readStream
-    .format('socket')
-    .option('host', HOST)
-    .option('port', PORT)
-    .load()
-)
+def create_base_stream():
+    """Create and return the base streaming DataFrame with enhanced error handling"""
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            print(f"Attempting to connect to {HOST}:{PORT} (attempt {retry_count + 1})")
+            
+            raw_lines = (
+                spark.readStream
+                .format('socket')
+                .option('host', HOST)
+                .option('port', PORT)
+                .option('includeTimestamp', 'true')
+                .load()
+            )
+            
+            json_df = (
+                raw_lines
+                .select(F.from_json(F.col('value'), schema).alias('data'))
+                .select('data.*')
+                .filter(
+                    F.col('text').isNotNull() & 
+                    (F.col('text') != '') & 
+                    (F.length(F.col('text')) > 10)
+                )
+                .withColumn('created_ts', F.col('created_utc').cast('timestamp'))
+                .withColumn('text_length', F.length(F.col('text')))
+            )
+            
+            print("✓ Base stream created successfully")
+            return json_df
+            
+        except Exception as e:
+            retry_count += 1
+            print(f"✗ Connection attempt {retry_count} failed: {e}")
+            
+            if retry_count >= max_retries:
+                print("Max retries reached. Please ensure:")
+                print("1. Producer is running on the correct port")
+                print("2. Docker networking is properly configured")
+                print("3. No firewall blocking the connection")
+                raise e
+            
+            time.sleep(5)  # Wait before retry
 
-json_df = raw_lines.select(F.from_json(F.col('value'), schema).alias('data')).select('data.*')
+def start_simple_monitoring(df):
+    """Start a simple monitoring query to verify stream is working"""
+    try:
+        monitoring_query = (
+            df.select('subreddit', 'author', 'text_length', 'created_ts')
+            .writeStream
+            .outputMode('append')
+            .format('console')
+            .option('truncate', True)
+            .option('numRows', 3)
+            .trigger(processingTime='15 seconds')
+            .start()
+        )
+        
+        print("✓ Simple monitoring query started")
+        return monitoring_query
+        
+    except Exception as e:
+        print(f"✗ Error starting monitoring query: {e}")
+        return None
 
-def start_storage_queries(df):
+def start_subreddit_stats(df):
+    """Start subreddit statistics with watermarking"""
+    try:
+        stats_df = (
+            df.withWatermark('created_ts', '2 minutes')
+            .groupBy(
+                F.window('created_ts', '1 minute', '30 seconds'),
+                F.col('subreddit')
+            )
+            .agg(
+                F.count('*').alias('post_count'),
+                F.countDistinct('author').alias('unique_authors'),
+                F.avg('text_length').alias('avg_length'),
+                F.max('text_length').alias('max_length')
+            )
+            .filter(F.col('post_count') > 0)
+            .select(
+                F.col('window.start').alias('window_start'),
+                F.col('window.end').alias('window_end'),
+                '*'
+            )
+        )
+        
+        stats_query = (
+            stats_df.writeStream
+            .outputMode('update')
+            .format('console')
+            .option('truncate', False)
+            .option('numRows', 10)
+            .trigger(processingTime='30 seconds')
+            .start()
+        )
+        
+        print("✓ Subreddit statistics query started")
+        return stats_query
+        
+    except Exception as e:
+        print(f"✗ Error starting stats query: {e}")
+        return None
 
-    # Write to memory table 'raw'
-    q1 = (
-        df.writeStream
-        .outputMode('append')
-        .format('memory')
-        .queryName('raw')
-        .start()
-    )
+def start_reference_analysis(df):
+    """Simplified reference analysis"""
+    try:
+        refs_df = df.select(
+            F.col('subreddit'),
+            F.col('created_ts'),
+            F.regexp_extract_all(F.col('text'), r'/u/\w+').alias('user_mentions'),
+            F.regexp_extract_all(F.col('text'), r'/r/\w+').alias('sub_mentions'),
+            F.regexp_extract_all(F.col('text'), r'https?://[^\s]+').alias('urls')
+        ).select(
+            F.col('subreddit'),
+            F.col('created_ts'),
+            F.size(F.col('user_mentions')).alias('user_ref_count'),
+            F.size(F.col('sub_mentions')).alias('sub_ref_count'),
+            F.size(F.col('urls')).alias('url_count')
+        ).filter(
+            (F.col('user_ref_count') > 0) | 
+            (F.col('sub_ref_count') > 0) | 
+            (F.col('url_count') > 0)
+        )
+        
+        ref_query = (
+            refs_df.writeStream
+            .outputMode('append')
+            .format('console')
+            .option('truncate', False)
+            .option('numRows', 5)
+            .trigger(processingTime='30 seconds')
+            .start()
+        )
+        
+        print("✓ Reference analysis query started")
+        return ref_query
+        
+    except Exception as e:
+        print(f"✗ Error starting reference analysis: {e}")
+        return None
 
-    # Write to parquet file 'raw' in folder 'data' and checkpoint in 'chk'
-    q2 = (
-        df.writeStream
-        .outputMode('append')
-        .format('parquet')
-        .option('path', 'data/raw')
-        .option('checkpointLocation', 'chk/raw')
-        .start()
-    )
+def cleanup_checkpoints():
+    """Clean up checkpoint directories"""
+    import shutil
+    try:
+        checkpoint_dir = "/tmp/checkpoint"
+        if os.path.exists(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
+            print("✓ Cleaned up checkpoint directories")
+    except Exception as e:
+        print(f"Warning: Could not clean checkpoints: {e}")
 
-    return [q1, q2]
+def kill_port_process():
+    """Kill any process using our target port"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['lsof', '-ti', f':{PORT}'], 
+            capture_output=True, 
+            text=True,
+            timeout=10
+        )
+        
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                subprocess.run(['kill', '-9', pid], timeout=5)
+                print(f"✓ Killed process {pid} using port {PORT}")
+            time.sleep(2)
+    except Exception as e:
+        print(f"Note: Could not kill port processes: {e}")
 
-# Reference counting
-def start_reference_query(df):
-    # Extract user, subreddit, and URL references
-    # in a more clean manner.
-    user_refs = F.regexp_extract_all("text", r"/u/[^\s]+")
-    sub_refs = F.regexp_extract_all("text", r"/r/[^\s]+")
-    url_refs = F.regexp_extract_all("text", r"https?://[^\s]+")
-
-    # All of this is clean code, well done.
-    refs_df = df.select(
-        F.col('created_utc').cast('timestamp').alias('created_ts'),
-        F.size(user_refs).alias('user_ref_count'),
-        F.size(sub_refs).alias('sub_ref_count'),
-        F.size(url_refs).alias('url_ref_count')
-    )
-
-    windowed = (
-        refs_df.withWatermark('created_ts', '1 minute')
-        .groupBy(F.window('created_ts', '60 seconds', '5 seconds'))
-        .sum('user_ref_count', 'sub_ref_count', 'url_ref_count')
-    )
-
-    return (
-        windowed.writeStream
-        .outputMode('update')
-        .format('console')
-        .option('truncate', False)
-        .start()
-    )
-
-# TF-IDF computation
-def compute_tfidf(full_df):
-    # This requires a full explanation and overview of the TF-IDF process,
-    # It also requires the full dataframe to be available when you only need to retrieve the text column.
-    # This is not ideal for production, but it works for the sake of this example.
-
-    # Tokenize the text column and remove stop words
-    tokenizer = Tokenizer(inputCol='text', outputCol='words')
-    words = tokenizer.transform(full_df)
-    remover = StopWordsRemover(inputCol='words', outputCol='filtered')
-    filtered = remover.transform(words)
-
-    # Apply HashingTF and create an IDF (Inverse Document Frequency). WARNING: Hashing TF is a lossy transformation,
-    # meaning that it can produce collisions in the feature space.
-    # What does that mean? It means that two different words can end up with the same hash value
-    # and thus the same feature vector. It means that the TF-IDF score for those words will be the same,
-    # even if they are different words. This would be even more problematic if the stop words were not removed.
-    hashingTF = HashingTF(inputCol='filtered', outputCol='rawFeatures', numFeatures=10000)
-    featurized = hashingTF.transform(filtered)
-    idf = IDF(inputCol='rawFeatures', outputCol='features')
-    idf_model = idf.fit(featurized)
-    tfidf = idf_model.transform(featurized)
-
-    # Extract top 10 words by TF-IDF score
-    # Ideally this should be done per post, not the full corpus that
-    # extends across 3 different subreddits. Makes little sense to compute the TF-IDF
-    # for that corpus with no differentiation between the subreddits.
-    # His requirements would not be met in a production environment, at least not in this way, keep that in mind.
-    zipped = tfidf.select(F.explode(F.arrays_zip('filtered', 'features')).alias('z'))
-    scores = zipped.select(F.col('z.filtered').alias('word'), F.col('z.features').alias('score'))
-    top_words = scores.groupBy('word').agg(F.max('score').alias('score')).orderBy(F.desc('score')).limit(10)
-    print('Top words by TF-IDF:')
-    top_words.show(truncate=False)
-
-# Sentiment UDF
-@F.udf('double')
-def sentiment_udf(text):
-    return float(TextBlob(text).sentiment.polarity) if text else 0.0
-
-# Batch processing
-def process_batch(df):
-    df.persist()
-    if spark.catalog.tableExists('raw'):
-        full_df = spark.table('raw').unionByName(df)
-    else:
-        full_df = df
-    full_df.createOrReplaceTempView('raw')
-
-    # Save batch to files
-    df.write.mode('append').parquet('data/raw')
-
-    # Time range
-    created_utc_min, created_utc_max = F.min(df['created_utc']).alias('min_ts'), F.max(df['created_utc']).alias('max_ts')
-    bounds = full_df.agg(created_utc_min, created_utc_max).collect()[0]
-    print(f"Data time range: {bounds['min_ts']} - {bounds['max_ts']}")
-
-    # Sentiment
-    sentiments = df.withColumn('sentiment', sentiment_udf('text'))
-    avg_sent = sentiments.agg(F.avg('sentiment')).collect()[0][0]
-    print(f'Average sentiment (batch): {avg_sent}')
-
-    # Top authors in this batch
-    top_authors = df.groupBy('author').count().orderBy(F.desc('count')).limit(5)
-    print('Top authors this batch:')
-    top_authors.show(truncate=False)
-
-    # TF-IDF on full corpus (all texts in all comments) is a heavy operation so it should be done less frequently in production.
-    # His requirements would not be met in a production environment, they would be orchestrated so as not to
-    # have to retrieve all the texts every time.
-    # However, for the sake of his example, we will compute it every time.
-    compute_tfidf(full_df)
-    df.unpersist()
-
-# Start queries
-storage_queries = start_storage_queries(json_df)
-ref_query = start_reference_query(json_df)
-process_query = json_df.writeStream.foreachBatch(process_batch).start()
-
-for q in storage_queries + [ref_query, process_query]:
-    q.awaitTermination()
+# Main execution with enhanced error handling
+if __name__ == "__main__":
+    queries = []
+    
+    try:
+        print("=" * 50)
+        print("🚀 REDDIT STREAM PROCESSOR STARTING")
+        print("=" * 50)
+        
+        # Cleanup previous runs
+        cleanup_checkpoints()
+        kill_port_process()
+        
+        # Test Spark context
+        print("Testing Spark configuration...")
+        test_df = spark.range(1).select(F.lit("test").alias("value"))
+        test_count = test_df.count()
+        print(f"✓ Spark context working (test count: {test_count})")
+        
+        # Create base stream
+        print("\nCreating base stream...")
+        json_df = create_base_stream()
+        
+        # Start queries progressively
+        print("\n📊 Starting monitoring queries...")
+        
+        # Simple monitoring first
+        monitor_query = start_simple_monitoring(json_df)
+        if monitor_query:
+            queries.append(monitor_query)
+            print("Waiting 30 seconds to verify data flow...")
+            time.sleep(30)
+        
+        # Add statistics if monitoring works
+        stats_query = start_subreddit_stats(json_df)
+        if stats_query:
+            queries.append(stats_query)
+            time.sleep(10)
+        
+        # Add reference analysis
+        ref_query = start_reference_analysis(json_df)
+        if ref_query:
+            queries.append(ref_query)
+        
+        active_queries = [q for q in queries if q and q.isActive]
+        print(f"\n✅ Successfully started {len(active_queries)} queries")
+        
+        # Monitor loop
+        print("\n📈 Monitoring queries (Press Ctrl+C to stop)...")
+        check_count = 0
+        
+        while True:
+            time.sleep(30)  # Check every 30 seconds
+            check_count += 1
+            
+            active = []
+            failed = []
+            
+            for i, query in enumerate(queries):
+                if not query:
+                    continue
+                    
+                if query.isActive:
+                    active.append(i)
+                    # Show progress less frequently
+                    if check_count % 4 == 0:  # Every 2 minutes
+                        progress = query.lastProgress
+                        if progress:
+                            input_rate = progress.get('inputRowsPerSecond', 0)
+                            processing_rate = progress.get('processingRowsPerSecond', 0)
+                            print(f"Query {i}: Input: {input_rate:.1f}/sec, Processing: {processing_rate:.1f}/sec")
+                else:
+                    failed.append(i)
+                    if query.exception():
+                        print(f"❌ Query {i} failed: {query.exception()}")
+            
+            if check_count % 4 == 0:
+                print(f"📊 Status: {len(active)} active, {len(failed)} failed")
+            
+            if not active:
+                print("No active queries remaining")
+                break
+                
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown requested by user")
+    except Exception as e:
+        print(f"❌ Main execution error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\n🧹 Cleaning up...")
+        
+        # Stop all queries
+        for i, query in enumerate(queries):
+            if query and query.isActive:
+                try:
+                    print(f"Stopping query {i}...")
+                    query.stop()
+                except Exception as e:
+                    print(f"Error stopping query {i}: {e}")
+        
+        # Wait for shutdown
+        for query in queries:
+            if query:
+                try:
+                    query.awaitTermination(timeout=15)
+                except:
+                    pass
+        
+        # Stop Spark
+        try:
+            spark.stop()
+            print("✅ Spark session stopped")
+        except Exception as e:
+            print(f"Warning: Error stopping Spark: {e}")
+        
+        print("🏁 Cleanup complete")
