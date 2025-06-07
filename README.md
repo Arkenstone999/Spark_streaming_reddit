@@ -15,4 +15,4 @@ This repository demonstrates streaming Reddit posts and comments over a socket a
 3. Open the Jupyter interface and execute `producer.ipynb` to start streaming data from Reddit.
 4. In a separate notebook or terminal, run `consumer.ipynb` or `consumer.py` to process the data.
 
-Environment variables `CLIENT_ID` and `SECRET_TOKEN` must be provided for Reddit API access.
+Environment variables `CLIENT_ID`, `SECRET_TOKEN`, and `USER_AGENT` must be provided for Reddit API access.
