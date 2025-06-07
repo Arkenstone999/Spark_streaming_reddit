@@ -4,11 +4,9 @@
 #### or
 #### from utils import {function_name}
 
-import os
 import json
 import requests
 import praw
-import socket
 
 
 def request_json(url, params=None):

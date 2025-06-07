@@ -1,10 +1,6 @@
-import json
-import re
-from textblob import TextBlob
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
-from pyspark.ml.feature import Tokenizer, StopWordsRemover, HashingTF, IDF
 import time
 import os
 
