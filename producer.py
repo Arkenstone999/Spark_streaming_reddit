@@ -4,13 +4,12 @@ import json
 import time
 import praw
 
-HOST = os.getenv('PRODUCER_HOST', '127.0.0.1')
+HOST = os.getenv('PRODUCER_HOST', '0.0.0.0')
 PORT = int(os.getenv('PRODUCER_PORT', '9998'))
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('SECRET_TOKEN')
 USER_AGENT = os.getenv('USER_AGENT', 'MyRedditApp/0.0.1')
-
 # If you have an environment variable you retrieve from a secure space and you still set the default, 
 # it doesn't need to be an environment variable in a secure space.
 SUBREDDITS = ['dataisbeautiful', 'python', 'spark']
@@ -31,8 +30,8 @@ def merge_streams(comment_stream, submission_stream):
 
 def stream_and_send(conn):
     for sub in SUBREDDITS:
-        comment_stream = reddit.subreddit(sub).stream.comments(skip_existing=True)
-        submission_stream = reddit.subreddit(sub).stream.submissions(skip_existing=True)
+        comment_stream = reddit.subreddit(sub).stream.comments(skip_existing=False)
+        submission_stream = reddit.subreddit(sub).stream.submissions(skip_existing=False)
          # This will have a side effect when scaled: hardware catches up with the stream and for loop ends
          # This round-robin approach is not ideal for scaling, but it works for a single producer
         for item in merge_streams(comment_stream, submission_stream):
